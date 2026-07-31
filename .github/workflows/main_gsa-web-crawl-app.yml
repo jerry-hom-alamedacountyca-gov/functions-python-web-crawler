@@ -40,7 +40,7 @@ jobs:
       # Optional: Add step to run tests here
 
       - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
+        run: zip release.zip ./* -r -x 'venv/*'
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
@@ -94,4 +94,5 @@ jobs:
           app-name: 'GSA-web-crawl-app'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          remote-build: true
           
