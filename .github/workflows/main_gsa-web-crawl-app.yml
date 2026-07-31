@@ -56,6 +56,7 @@ jobs:
     permissions:
       id-token: write #This is required for requesting the JWT
       contents: read #This is required for actions/checkout
+      actions: write #This is required for OIDC sub claim customization
 
     steps:
       - name: Download artifact from build job
@@ -67,13 +68,24 @@ jobs:
         run: |
           unzip release.zip
           rm release.zip
-        
+
+      - name: Configure OIDC sub claim format
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.request('PUT /repos/{owner}/{repo}/actions/oidc/customization/sub', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              use_default: false,
+              include_claim_keys: ['repo', 'ref']
+            });
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_69B1B261451F46C4A08B52E3BCB51F1B }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9F951C8304014C2F965B0F71E239D2BF }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_81D58ACF2AEB437C8F2355F8506D9401 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_CA4CE9122B2349599E3949518AB7855E }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_73D4DF9E413347CA89371F31E0C39F2C }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_45E4C13320934073B4E3F0D1EA91735F }}
 
       - name: 'Deploy to Azure Functions'
         uses: Azure/functions-action@v1
