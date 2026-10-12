@@ -28,6 +28,150 @@ REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+AUTH_PROFILES = {
+    "wordpress": {
+        "type": "wordpress",
+        "base_url_setting": "WORDPRESS_BASE_URL",
+        "username_setting": "WORDPRESS_USERNAME",
+        "password_setting": "WORDPRESS_PASSWORD",
+    },
+}
+
+
+class CrawlSession:
+    def __init__(self, session, authenticated_base_url=None):
+        self._session = session
+        self._authenticated_base_url = authenticated_base_url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_value):
+        self.close()
+
+    def close(self):
+        self._session.close()
+
+    def get(self, url, **kwargs):
+        if self._authenticated_base_url and not _same_origin(url, self._authenticated_base_url):
+            raise ValueError("Authenticated crawls cannot request URLs outside the configured WordPress origin")
+
+        response = self._session.get(url, **kwargs)
+
+        if self._authenticated_base_url:
+            if not _same_origin(response.url, self._authenticated_base_url):
+                response.close()
+                raise RuntimeError("An authenticated crawl was redirected outside the configured WordPress origin")
+            if urlparse(response.url).path.rstrip("/").endswith("/wp-login.php"):
+                response.close()
+                raise RuntimeError("The WordPress session expired or the requested page requires authentication")
+
+        return response
+
+
+def _url_origin(url):
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        return None
+
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, parsed.hostname.lower(), port
+
+
+def _same_origin(first_url, second_url):
+    first_origin = _url_origin(first_url)
+    return first_origin is not None and first_origin == _url_origin(second_url)
+
+
+def get_auth_profile(profile_name):
+    if not profile_name:
+        return None
+
+    profile = AUTH_PROFILES.get(profile_name)
+    if not profile:
+        raise ValueError(f"Unsupported authentication profile: {profile_name}")
+
+    setting_fields = {
+        "base_url": profile["base_url_setting"],
+        "username": profile["username_setting"],
+        "password": profile["password_setting"],
+    }
+    resolved = {"type": profile["type"]}
+    missing_settings = []
+
+    for field, setting_name in setting_fields.items():
+        value = os.environ.get(setting_name)
+        if value:
+            resolved[field] = value
+        else:
+            missing_settings.append(setting_name)
+
+    if missing_settings:
+        raise RuntimeError(
+            f"Authentication profile '{profile_name}' is missing required application settings: "
+            f"{', '.join(missing_settings)}"
+        )
+
+    if _url_origin(resolved["base_url"]) is None:
+        raise RuntimeError(f"Authentication profile '{profile_name}' has an invalid base URL")
+
+    return resolved
+
+
+def authenticate_wordpress(session, requested_url, profile):
+    base_url = profile["base_url"].rstrip("/")
+    if not _same_origin(requested_url, base_url):
+        raise ValueError("The WordPress authentication profile cannot be used for the requested URL")
+
+    login_url = f"{base_url}/wp-login.php"
+    response = session.get(login_url, timeout=15)
+    response.raise_for_status()
+
+    response = session.post(
+        login_url,
+        data={
+            "log": profile["username"],
+            "pwd": profile["password"],
+            "wp-submit": "Log In",
+            "redirect_to": f"{base_url}/",
+            "testcookie": "1",
+        },
+        timeout=15,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    if not _same_origin(response.url, base_url):
+        raise RuntimeError("WordPress authentication redirected outside the configured origin")
+
+    if not any(cookie.name.startswith("wordpress_logged_in_") for cookie in session.cookies):
+        raise RuntimeError("WordPress authentication failed")
+
+
+def create_crawl_session(url, profile_name=None):
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+
+    try:
+        profile = get_auth_profile(profile_name)
+        if not profile:
+            return CrawlSession(session)
+
+        if profile["type"] == "wordpress":
+            authenticate_wordpress(session, url, profile)
+            return CrawlSession(session, profile["base_url"])
+
+        raise ValueError(f"Unsupported authentication type: {profile['type']}")
+    except Exception:
+        session.close()
+        raise
 
 
 def _get_azure_identity_credential():
@@ -119,27 +263,43 @@ def parse_semantic_config(raw):
     return mapping
 
 
-@app.route(route="search_site", methods=["POST"])
+@app.route(route="search_site", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def search_site(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
 
     url = req.params.get('url')
+    auth_profile = req.params.get('auth_profile')
     max_pages = None
-    if not url:
-        try:
-            req_body = req.get_json()
-        except ValueError:
-            pass
-        else:
-            url = req_body.get('url')
-            max_pages = req_body.get('max_pages')
+    try:
+        req_body = req.get_json()
+    except ValueError:
+        req_body = {}
+
+    url = url or req_body.get('url')
+    auth_profile = auth_profile or req_body.get('auth_profile')
+    max_pages = req_body.get('max_pages')
 
     if url:
         if validators.url(url):
-            if _is_sitemap_candidate(url):
-                result = crawl_sitemap(url, max_pages)
-            else:
-                result = orchestrator_function(url)
+            try:
+                with create_crawl_session(url, auth_profile) as session:
+                    if _is_sitemap_candidate(url):
+                        result = crawl_sitemap(url, max_pages, session)
+                    else:
+                        result = orchestrator_function(url, session)
+            except ValueError as error:
+                return func.HttpResponse(
+                    json.dumps({"error": str(error)}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+            except RuntimeError as error:
+                logging.error("Unable to initialize authenticated crawl: %s", error)
+                return func.HttpResponse(
+                    json.dumps({"error": str(error)}),
+                    status_code=500,
+                    mimetype="application/json"
+                )
             return func.HttpResponse(
                 json.dumps(result, indent=2),
                 status_code=200,
@@ -263,9 +423,13 @@ def search_indexes(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-def orchestrator_function(url):
+def orchestrator_function(url, session=None):
+    if session is None:
+        with create_crawl_session(url) as anonymous_session:
+            return orchestrator_function(url, anonymous_session)
+
     try:
-        data = crawl_site(url)
+        data = crawl_site(url, session)
 
         title = get_page_title(data)
         description = get_meta_tag(data)
@@ -320,12 +484,16 @@ def _build_sitemap_url(url):
     return urlunparse((parsed.scheme, parsed.netloc, "/sitemap.xml", "", "", ""))
 
 
-def fetch_sitemap(url):
+def fetch_sitemap(url, session=None):
     """Fetch and parse a sitemap, returning a list of page URLs."""
+    if session is None:
+        with create_crawl_session(url) as anonymous_session:
+            return fetch_sitemap(url, anonymous_session)
+
     sitemap_url = _build_sitemap_url(url)
     logging.info(f"Fetching sitemap from: {sitemap_url}")
 
-    response = requests.get(sitemap_url, headers=REQUEST_HEADERS, allow_redirects=True, timeout=15)
+    response = session.get(sitemap_url, allow_redirects=True, timeout=15)
     response.raise_for_status()
 
     root = ET.fromstring(response.content)
@@ -345,7 +513,7 @@ def fetch_sitemap(url):
                 if loc is not None and loc.text:
                     try:
                         nested_sitemap_url = urljoin(sitemap_url, loc.text.strip())
-                        urls.extend(fetch_sitemap(nested_sitemap_url))
+                        urls.extend(fetch_sitemap(nested_sitemap_url, session))
                     except Exception as e:
                         logging.warning(f"Failed to fetch sub-sitemap {loc.text}: {e}")
             return urls
@@ -367,25 +535,29 @@ def fetch_sitemap(url):
     return urls
 
 
-def crawl_sitemap(domain_url, max_pages=None):
+def crawl_sitemap(domain_url, max_pages=None, session=None):
     """Crawl all pages discovered from a sitemap."""
+    if session is None:
+        with create_crawl_session(domain_url) as anonymous_session:
+            return crawl_sitemap(domain_url, max_pages, anonymous_session)
+
     if max_pages is None:
         max_pages = DEFAULT_MAX_PAGES
 
     try:
-        page_urls = fetch_sitemap(domain_url)
+        page_urls = fetch_sitemap(domain_url, session)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             logging.info("No sitemap found, falling back to single-page crawl.")
-            return orchestrator_function(domain_url)
+            return orchestrator_function(domain_url, session)
         raise
     except Exception as e:
         logging.warning(f"Failed to fetch sitemap: {e}. Falling back to single-page crawl.")
-        return orchestrator_function(domain_url)
+        return orchestrator_function(domain_url, session)
 
     if not page_urls:
         logging.info("Sitemap was empty or had no URLs. Falling back to single-page crawl.")
-        return orchestrator_function(domain_url)
+        return orchestrator_function(domain_url, session)
 
     total_found = len(page_urls)
     page_urls = page_urls[:max_pages]
@@ -394,7 +566,7 @@ def crawl_sitemap(domain_url, max_pages=None):
     errors = []
     for page_url in page_urls:
         try:
-            result = orchestrator_function(page_url)
+            result = orchestrator_function(page_url, session)
             if "error" in result:
                 errors.append({"url": page_url, "error": result["error"]})
             else:
@@ -414,8 +586,12 @@ def crawl_sitemap(domain_url, max_pages=None):
     }
 
 
-def crawl_site(url):
-    response = requests.get(url, headers=REQUEST_HEADERS, allow_redirects=True, timeout=15)
+def crawl_site(url, session=None):
+    if session is None:
+        with create_crawl_session(url) as anonymous_session:
+            return crawl_site(url, anonymous_session)
+
+    response = session.get(url, allow_redirects=True, timeout=15)
     response.raise_for_status()
     return BeautifulSoup(response.text, "lxml")
 

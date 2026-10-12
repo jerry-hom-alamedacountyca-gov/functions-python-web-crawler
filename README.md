@@ -102,6 +102,27 @@ Azure Testing:
     2.  https://www.pluralsight.com/
     3.  https://www.linkedin.com/
 
+### Crawling an authenticated WordPress site
+
+Anonymous crawling remains the default. To crawl a protected WordPress site, configure these Function App settings:
+
+- `WORDPRESS_BASE_URL`: The WordPress site URL, such as `https://wordpress.example.com`.
+- `WORDPRESS_USERNAME`: A dedicated, least-privilege service account.
+- `WORDPRESS_PASSWORD`: The service account password. In Azure, use an Azure Key Vault reference for this value.
+
+Then select the server-side profile in the request:
+
+```json
+{
+  "url": "https://wordpress.example.com",
+  "auth_profile": "wordpress"
+}
+```
+
+The profile name maps to the settings above; callers cannot provide or override credentials. The authenticated crawl is restricted to the origin configured by `WORDPRESS_BASE_URL`. WordPress login flows that require interactive MFA, CAPTCHA, or SSO are not supported.
+
+The `search_site` endpoint uses Function-level authorization. Include the Function key when calling a deployed Function App.
+
 ## Searching indexes
 
 The `search_indexes` function authenticates to Azure AI Search with Microsoft Entra ID and searches the indexes listed in `SEARCH_INDEX_NAMES`. Configure these Function App settings:
