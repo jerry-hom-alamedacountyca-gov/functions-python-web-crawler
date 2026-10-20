@@ -9,11 +9,10 @@ import traceback
 import validators
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
 from azure.search.documents import SearchClient
-from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob import BlobServiceClient
 from bs4 import BeautifulSoup
 
@@ -22,31 +21,240 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 CHUNK_SIZE = 2000  # characters per chunk, tuned for AI Search
 DEFAULT_MAX_PAGES = int(os.environ.get("CRAWL_MAX_PAGES", "100"))
 CRAWL_NESTED_SITEMAPS = os.environ.get("CRAWL_NESTED_SITEMAPS", "false").lower() == "true"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+GRAPH_REQUEST_TIMEOUT = int(os.environ.get("GRAPH_REQUEST_TIMEOUT", "10"))
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+AUTH_PROFILES = {
+    "wordpress": {
+        "type": "wordpress",
+        "base_url_setting": "WORDPRESS_BASE_URL",
+        "username_setting": "WORDPRESS_USERNAME",
+        "password_setting": "WORDPRESS_PASSWORD",
+    },
+}
+
+
+class CrawlSession:
+    def __init__(self, session, authenticated_base_url=None):
+        self._session = session
+        self._authenticated_base_url = authenticated_base_url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_value):
+        self.close()
+
+    def close(self):
+        self._session.close()
+
+    def get(self, url, **kwargs):
+        if self._authenticated_base_url and not _same_origin(url, self._authenticated_base_url):
+            raise ValueError("Authenticated crawls cannot request URLs outside the configured WordPress origin")
+
+        response = self._session.get(url, **kwargs)
+
+        if self._authenticated_base_url:
+            if not _same_origin(response.url, self._authenticated_base_url):
+                response.close()
+                raise RuntimeError("An authenticated crawl was redirected outside the configured WordPress origin")
+            if urlparse(response.url).path.rstrip("/").endswith("/wp-login.php"):
+                response.close()
+                raise RuntimeError("The WordPress session expired or the requested page requires authentication")
+
+        return response
+
+
+def _url_origin(url):
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        return None
+
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, parsed.hostname.lower(), port
+
+
+def _same_origin(first_url, second_url):
+    first_origin = _url_origin(first_url)
+    return first_origin is not None and first_origin == _url_origin(second_url)
+
+
+def get_auth_profile(profile_name):
+    if not profile_name:
+        return None
+
+    profile = AUTH_PROFILES.get(profile_name)
+    if not profile:
+        raise ValueError(f"Unsupported authentication profile: {profile_name}")
+
+    setting_fields = {
+        "base_url": profile["base_url_setting"],
+        "username": profile["username_setting"],
+        "password": profile["password_setting"],
+    }
+    resolved = {"type": profile["type"]}
+    missing_settings = []
+
+    for field, setting_name in setting_fields.items():
+        value = os.environ.get(setting_name)
+        if value:
+            resolved[field] = value
+        else:
+            missing_settings.append(setting_name)
+
+    if missing_settings:
+        raise RuntimeError(
+            f"Authentication profile '{profile_name}' is missing required application settings: "
+            f"{', '.join(missing_settings)}"
+        )
+
+    if _url_origin(resolved["base_url"]) is None:
+        raise RuntimeError(f"Authentication profile '{profile_name}' has an invalid base URL")
+
+    return resolved
+
+
+def authenticate_wordpress(session, requested_url, profile):
+    base_url = profile["base_url"].rstrip("/")
+    if not _same_origin(requested_url, base_url):
+        raise ValueError("The WordPress authentication profile cannot be used for the requested URL")
+
+    login_url = f"{base_url}/wp-login.php"
+    response = session.get(login_url, timeout=15)
+    response.raise_for_status()
+
+    response = session.post(
+        login_url,
+        data={
+            "log": profile["username"],
+            "pwd": profile["password"],
+            "wp-submit": "Log In",
+            "redirect_to": f"{base_url}/",
+            "testcookie": "1",
+        },
+        timeout=15,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    if not _same_origin(response.url, base_url):
+        raise RuntimeError("WordPress authentication redirected outside the configured origin")
+
+    if not any(cookie.name.startswith("wordpress_logged_in_") for cookie in session.cookies):
+        raise RuntimeError("WordPress authentication failed")
+
+
+def create_crawl_session(url, profile_name=None):
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+
+    try:
+        profile = get_auth_profile(profile_name)
+        if not profile:
+            return CrawlSession(session)
+
+        if profile["type"] == "wordpress":
+            authenticate_wordpress(session, url, profile)
+            return CrawlSession(session, profile["base_url"])
+
+        raise ValueError(f"Unsupported authentication type: {profile['type']}")
+    except Exception:
+        session.close()
+        raise
+
+
+def _get_azure_identity_credential():
+    client_id = os.environ.get("MANAGED_IDENTITY_CLIENT_ID")
+    if client_id:
+        return ManagedIdentityCredential(client_id=client_id)
+    return DefaultAzureCredential()
+
+
+def _build_graph_item_url(doc_url):
+    """Return a trusted, encoded Graph drive-item URL."""
+    if not isinstance(doc_url, str) or not doc_url.strip():
+        return None
+
+    doc_url = doc_url.strip()
+    if doc_url.startswith("/") and not doc_url.startswith("//"):
+        path = doc_url
+        query = ""
+    else:
+        parsed = urlparse(doc_url)
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname != "graph.microsoft.com"
+            or parsed.username
+            or parsed.password
+            or port not in (None, 443)
+        ):
+            return None
+        path = parsed.path
+        query = parsed.query
+
+    if path.startswith("/drives/"):
+        path = f"/v1.0{path}"
+    elif not path.startswith("/v1.0/drives/"):
+        return None
+
+    encoded_path = quote(path, safe="/%:!$&'()*+,;=@-._~")
+    return urlunparse(("https", "graph.microsoft.com", encoded_path, "", query, ""))
+
+
+def _resolve_sharepoint_url(doc_url, access_token):
+    graph_url = _build_graph_item_url(doc_url)
+    if not graph_url:
+        logging.warning("Ignoring an invalid or untrusted doc_url: %r", doc_url)
+        return None
+
+    try:
+        response = requests.get(
+            graph_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=GRAPH_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        web_url = response.json().get("webUrl")
+        if not web_url:
+            logging.warning("Microsoft Graph returned no webUrl for doc_url: %s", doc_url)
+            return None
+        return web_url
+    except requests.exceptions.RequestException as error:
+        status_code = error.response.status_code if error.response is not None else None
+        logging.warning(
+            "Failed to resolve doc_url through Microsoft Graph (status=%s): %s",
+            status_code,
+            doc_url,
+        )
+    except (TypeError, ValueError):
+        logging.warning("Microsoft Graph returned invalid JSON for doc_url: %s", doc_url)
+    return None
 
 
 def parse_semantic_config(raw):
-    """Parse the SEARCH_SEMANTIC_CONFIG env var into an index -> config mapping.
-
-    Supports two formats:
-    - A single config name applied to every index, e.g. "default".
-    - Per-index mappings, e.g. "index1=config1,index2=config2". A "*" key
-      (e.g. "*=fallback") sets the fallback used for any unlisted index.
-    """
+    """Parse a shared or per-index semantic configuration setting."""
     mapping = {}
     if not raw:
         return mapping
     if "=" not in raw:
-        # Single config name applies to all indexes.
         mapping["*"] = raw.strip()
         return mapping
     for pair in raw.split(","):
-        if not pair.strip():
-            continue
         index_name, _, config_name = pair.partition("=")
         index_name = index_name.strip()
         config_name = config_name.strip()
@@ -55,27 +263,43 @@ def parse_semantic_config(raw):
     return mapping
 
 
-@app.route(route="search_site", methods=["POST"])
+@app.route(route="search_site", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def search_site(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
 
     url = req.params.get('url')
+    auth_profile = req.params.get('auth_profile')
     max_pages = None
-    if not url:
-        try:
-            req_body = req.get_json()
-        except ValueError:
-            pass
-        else:
-            url = req_body.get('url')
-            max_pages = req_body.get('max_pages')
+    try:
+        req_body = req.get_json()
+    except ValueError:
+        req_body = {}
+
+    url = url or req_body.get('url')
+    auth_profile = auth_profile or req_body.get('auth_profile')
+    max_pages = req_body.get('max_pages')
 
     if url:
         if validators.url(url):
-            if _is_sitemap_candidate(url):
-                result = crawl_sitemap(url, max_pages)
-            else:
-                result = orchestrator_function(url)
+            try:
+                with create_crawl_session(url, auth_profile) as session:
+                    if _is_sitemap_candidate(url):
+                        result = crawl_sitemap(url, max_pages, session)
+                    else:
+                        result = orchestrator_function(url, session)
+            except ValueError as error:
+                return func.HttpResponse(
+                    json.dumps({"error": str(error)}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+            except RuntimeError as error:
+                logging.error("Unable to initialize authenticated crawl: %s", error)
+                return func.HttpResponse(
+                    json.dumps({"error": str(error)}),
+                    status_code=500,
+                    mimetype="application/json"
+                )
             return func.HttpResponse(
                 json.dumps(result, indent=2),
                 status_code=200,
@@ -101,14 +325,13 @@ def search_indexes(req: func.HttpRequest) -> func.HttpResponse:
 
     # Validate environment configuration
     search_endpoint = os.environ.get("SEARCH_ENDPOINT")
-    search_api_key = os.environ.get("SEARCH_API_KEY")
     index_names_raw = os.environ.get("SEARCH_INDEX_NAMES")
     semantic_config_raw = os.environ.get("SEARCH_SEMANTIC_CONFIG", "default")
     semantic_config_map = parse_semantic_config(semantic_config_raw)
 
-    if not search_endpoint or not search_api_key or not index_names_raw:
+    if not search_endpoint or not index_names_raw:
         return func.HttpResponse(
-            json.dumps({"error": "Missing required environment variables: SEARCH_ENDPOINT, SEARCH_API_KEY, SEARCH_INDEX_NAMES"}),
+            json.dumps({"error": "Missing required environment variables: SEARCH_ENDPOINT, SEARCH_INDEX_NAMES"}),
             status_code=400,
             mimetype="application/json"
         )
@@ -134,9 +357,12 @@ def search_indexes(req: func.HttpRequest) -> func.HttpResponse:
     top = req_body.get("top", 5)
     index_names = [name.strip() for name in index_names_raw.split(",") if name.strip()]
 
-    credential = AzureKeyCredential(search_api_key)
+    credential = _get_azure_identity_credential()
     all_results = []
     errors = []
+    resolved_url_cache = {}
+    graph_access_token = None
+    graph_token_attempted = False
 
     for index_name in index_names:
         try:
@@ -153,9 +379,27 @@ def search_indexes(req: func.HttpRequest) -> func.HttpResponse:
                 top=top,
             )
             for result in results:
+                source = result.get("url", "")
+                doc_url = result.get("doc_url")
+                if doc_url:
+                    if doc_url not in resolved_url_cache:
+                        if not graph_token_attempted:
+                            graph_token_attempted = True
+                            try:
+                                graph_access_token = credential.get_token(GRAPH_SCOPE).token
+                            except Exception as error:
+                                logging.warning("Unable to acquire a Microsoft Graph access token: %s", error)
+
+                        resolved_url_cache[doc_url] = (
+                            _resolve_sharepoint_url(doc_url, graph_access_token)
+                            if graph_access_token
+                            else None
+                        )
+                    source = resolved_url_cache[doc_url] or source
+
                 all_results.append({
                     "content": result.get("content") or result.get("chunk", ""),
-                    "source": result.get("url", ""),
+                    "source": source,
                     "title": result.get("title", ""),
                     "index_name": index_name,
                     "score": result.get("@search.reranker_score", result.get("@search.score", 0)),
@@ -179,9 +423,13 @@ def search_indexes(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-def orchestrator_function(url):
+def orchestrator_function(url, session=None):
+    if session is None:
+        with create_crawl_session(url) as anonymous_session:
+            return orchestrator_function(url, anonymous_session)
+
     try:
-        data = crawl_site(url)
+        data = crawl_site(url, session)
 
         title = get_page_title(data)
         description = get_meta_tag(data)
@@ -236,12 +484,16 @@ def _build_sitemap_url(url):
     return urlunparse((parsed.scheme, parsed.netloc, "/sitemap.xml", "", "", ""))
 
 
-def fetch_sitemap(url):
+def fetch_sitemap(url, session=None):
     """Fetch and parse a sitemap, returning a list of page URLs."""
+    if session is None:
+        with create_crawl_session(url) as anonymous_session:
+            return fetch_sitemap(url, anonymous_session)
+
     sitemap_url = _build_sitemap_url(url)
     logging.info(f"Fetching sitemap from: {sitemap_url}")
 
-    response = requests.get(sitemap_url, headers=REQUEST_HEADERS, allow_redirects=True, timeout=15)
+    response = session.get(sitemap_url, allow_redirects=True, timeout=15)
     response.raise_for_status()
 
     root = ET.fromstring(response.content)
@@ -261,7 +513,7 @@ def fetch_sitemap(url):
                 if loc is not None and loc.text:
                     try:
                         nested_sitemap_url = urljoin(sitemap_url, loc.text.strip())
-                        urls.extend(fetch_sitemap(nested_sitemap_url))
+                        urls.extend(fetch_sitemap(nested_sitemap_url, session))
                     except Exception as e:
                         logging.warning(f"Failed to fetch sub-sitemap {loc.text}: {e}")
             return urls
@@ -283,25 +535,29 @@ def fetch_sitemap(url):
     return urls
 
 
-def crawl_sitemap(domain_url, max_pages=None):
+def crawl_sitemap(domain_url, max_pages=None, session=None):
     """Crawl all pages discovered from a sitemap."""
+    if session is None:
+        with create_crawl_session(domain_url) as anonymous_session:
+            return crawl_sitemap(domain_url, max_pages, anonymous_session)
+
     if max_pages is None:
         max_pages = DEFAULT_MAX_PAGES
 
     try:
-        page_urls = fetch_sitemap(domain_url)
+        page_urls = fetch_sitemap(domain_url, session)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             logging.info("No sitemap found, falling back to single-page crawl.")
-            return orchestrator_function(domain_url)
+            return orchestrator_function(domain_url, session)
         raise
     except Exception as e:
         logging.warning(f"Failed to fetch sitemap: {e}. Falling back to single-page crawl.")
-        return orchestrator_function(domain_url)
+        return orchestrator_function(domain_url, session)
 
     if not page_urls:
         logging.info("Sitemap was empty or had no URLs. Falling back to single-page crawl.")
-        return orchestrator_function(domain_url)
+        return orchestrator_function(domain_url, session)
 
     total_found = len(page_urls)
     page_urls = page_urls[:max_pages]
@@ -310,7 +566,7 @@ def crawl_sitemap(domain_url, max_pages=None):
     errors = []
     for page_url in page_urls:
         try:
-            result = orchestrator_function(page_url)
+            result = orchestrator_function(page_url, session)
             if "error" in result:
                 errors.append({"url": page_url, "error": result["error"]})
             else:
@@ -330,8 +586,12 @@ def crawl_sitemap(domain_url, max_pages=None):
     }
 
 
-def crawl_site(url):
-    response = requests.get(url, headers=REQUEST_HEADERS, allow_redirects=True, timeout=15)
+def crawl_site(url, session=None):
+    if session is None:
+        with create_crawl_session(url) as anonymous_session:
+            return crawl_site(url, anonymous_session)
+
+    response = session.get(url, allow_redirects=True, timeout=15)
     response.raise_for_status()
     return BeautifulSoup(response.text, "lxml")
 
@@ -412,12 +672,7 @@ def upload_to_blob_storage(url, documents):
     try:
         account_url = os.environ["STORAGE_ACCOUNT_URL"]
         container_name = os.environ["STORAGE_CONTAINER_NAME"]
-        client_id = os.environ.get("MANAGED_IDENTITY_CLIENT_ID")
-
-        if client_id:
-            credential = ManagedIdentityCredential(client_id=client_id)
-        else:
-            credential = DefaultAzureCredential()
+        credential = _get_azure_identity_credential()
 
         blob_service_client = BlobServiceClient(account_url, credential=credential)
         container_client = blob_service_client.get_container_client(container_name)

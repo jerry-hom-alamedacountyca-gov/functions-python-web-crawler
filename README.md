@@ -12,7 +12,7 @@ description:
 ---
 
 # Python Web Crawler
-This sample shows how to crawl a website via a Python Azure Function using BeautifulSoup4 and extract specific information for manipulation/storage.
+123This sample shows how to crawl a website via a Python Azure Function using BeautifulSoup4 and extract specific information for manipulation/storage.
 
 ## Getting Started
 
@@ -102,6 +102,44 @@ Azure Testing:
     2.  https://www.pluralsight.com/
     3.  https://www.linkedin.com/
 
+### Crawling an authenticated WordPress site
+
+Anonymous crawling remains the default. To crawl a protected WordPress site, configure these Function App settings:
+
+- `WORDPRESS_BASE_URL`: The WordPress site URL, such as `https://wordpress.example.com`.
+- `WORDPRESS_USERNAME`: A dedicated, least-privilege service account.
+- `WORDPRESS_PASSWORD`: The service account password. In Azure, use an Azure Key Vault reference for this value.
+
+Then select the server-side profile in the request:
+
+```json
+{
+  "url": "https://wordpress.example.com",
+  "auth_profile": "wordpress"
+}
+```
+
+The profile name maps to the settings above; callers cannot provide or override credentials. The authenticated crawl is restricted to the origin configured by `WORDPRESS_BASE_URL`. WordPress login flows that require interactive MFA, CAPTCHA, or SSO are not supported.
+
+The `search_site` endpoint uses Function-level authorization. Include the Function key when calling a deployed Function App.
+
+## Searching indexes
+
+The `search_indexes` function authenticates to Azure AI Search with Microsoft Entra ID and searches the indexes listed in `SEARCH_INDEX_NAMES`. Configure these Function App settings:
+
+- `SEARCH_ENDPOINT`: The search service endpoint, such as `https://<service-name>.search.windows.net`.
+- `SEARCH_INDEX_NAMES`: A comma-separated list of indexes to query.
+- `SEARCH_SEMANTIC_CONFIG`: The semantic configuration name, or comma-separated per-index mappings. Defaults to `default`.
+- `GRAPH_REQUEST_TIMEOUT`: Optional Microsoft Graph request timeout in seconds. Defaults to `10`.
+- `MANAGED_IDENTITY_CLIENT_ID`: The client ID of the user-assigned managed identity. The same setting is used for AI Search, Microsoft Graph, and Blob Storage authentication.
+
+If an index has a retrievable `doc_url` field containing a Microsoft Graph `/drives/...` item URL, the function resolves its SharePoint `webUrl` and returns it as `source`. Resolution is cached for duplicate URLs during the request. Missing fields, token failures, and Graph failures are logged and fall back to the result's existing `url` field.
+
+Attach the user-assigned managed identity to the Function App, then grant it the **Search Index Data Reader** role on the Azure AI Search service. This is the least-privilege role required to query index documents, including semantic queries. The **Search Service Contributor** and **Search Index Data Contributor** roles are not required unless the application also manages indexes or writes documents.
+
+For local development, omit `MANAGED_IDENTITY_CLIENT_ID` to use `DefaultAzureCredential` with your Azure CLI or VS Code sign-in. Grant that developer identity the same **Search Index Data Reader** role. Azure AI Search must allow role-based access control; API-key-only authentication is not sufficient.
+
+The Function App identity also needs Microsoft Graph application access to the indexed SharePoint content. Prefer `Sites.Selected` with access granted only to the required sites. The function accepts only HTTPS URLs hosted by `graph.microsoft.com` or Graph-relative `/drives/...` paths.
 
 ## Resources
 
