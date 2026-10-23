@@ -127,32 +127,101 @@ def get_auth_profile(profile_name):
 
 def authenticate_wordpress(session, requested_url, profile):
     base_url = profile["base_url"].rstrip("/")
+
     if not _same_origin(requested_url, base_url):
-        raise ValueError("The WordPress authentication profile cannot be used for the requested URL")
+        raise ValueError(
+            "The WordPress authentication profile cannot be used for the requested URL"
+        )
 
     login_url = f"{base_url}/wp-login.php"
+
+    # STEP 1: GET wp-login.php to receive cookies + hidden fields
     response = session.get(login_url, timeout=15)
     response.raise_for_status()
 
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(response.text, "lxml")
+
+    # Extract redirect_to hidden field (fallback to /wp-admin)
+    redirect_el = soup.find("input", {"name": "redirect_to"})
+    redirect_to = (
+        redirect_el["value"]
+        if redirect_el and redirect_el.get("value")
+        else f"{base_url}/wp-admin/"
+    )
+
+    # Extract testcookie hidden field (fallback to "1")
+    testcookie_el = soup.find("input", {"name": "testcookie"})
+    testcookie_val = (
+        testcookie_el["value"] if testcookie_el and testcookie_el.get("value") else "1"
+    )
+
+    # STEP 2: POST login form with correct hidden fields
     response = session.post(
         login_url,
         data={
             "log": profile["username"],
             "pwd": profile["password"],
             "wp-submit": "Log In",
-            "redirect_to": f"{base_url}/",
-            "testcookie": "1",
+            "redirect_to": redirect_to,
+            "testcookie": testcookie_val,
         },
         timeout=15,
         allow_redirects=True,
     )
     response.raise_for_status()
 
+    # BLOCK REDIRECT LEAVING ORIGIN
     if not _same_origin(response.url, base_url):
-        raise RuntimeError("WordPress authentication redirected outside the configured origin")
+        response.close()
+        raise RuntimeError(
+            "WordPress authentication redirected outside the configured origin"
+        )
 
-    if not any(cookie.name.startswith("wordpress_logged_in_") for cookie in session.cookies):
+    # BLOCK FAILED LOGIN (redirect back to wp-login.php)
+    if urlparse(response.url).path.rstrip("/").endswith("/wp-login.php"):
+        response.close()
+        raise RuntimeError(
+            "The WordPress session expired or the requested page requires authentication"
+        )
+
+    # VERIFY LOGIN BY COOKIE
+    if not any(
+        cookie.name.startswith("wordpress_logged_in_") for cookie in session.cookies
+    ):
         raise RuntimeError("WordPress authentication failed")
+
+    
+#    base_url = profile["base_url"].rstrip("/")
+#    if not _same_origin(requested_url, base_url):
+#        raise ValueError("The WordPress authentication profile cannot be used for the requested URL")
+
+#    login_url = f"{base_url}/wp-login.php"
+#    response = session.get(login_url, timeout=15)
+#    response.raise_for_status()
+
+#    response = session.post(
+#        login_url,
+#        data={
+#            "log": profile["username"],
+#            "pwd": profile["password"],
+#            "wp-submit": "Log In",
+#            "redirect_to": f"{base_url}/",
+#            "testcookie": "1",
+#        },
+#        timeout=15,
+#        allow_redirects=True,
+#    )
+#    response.raise_for_status()
+
+#    if not _same_origin(response.url, base_url):
+#        raise RuntimeError("WordPress authentication redirected outside the configured origin")
+
+#    if not any(cookie.name.startswith("wordpress_logged_in_") for cookie in session.cookies):
+#        raise RuntimeError("WordPress authentication failed")
+
+
 
 
 def create_crawl_session(url, profile_name=None):
