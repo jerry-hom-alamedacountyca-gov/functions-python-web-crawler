@@ -334,7 +334,8 @@ def parse_semantic_config(raw):
 
 @app.route(route="search_site", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def search_site(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Python HTTP trigger function processed a request.')
+    logging.warning('Python HTTP trigger function processed a request.')
+    #logging.info('Python HTTP trigger function processed a request.')
 
     url = req.params.get('url')
     auth_profile = req.params.get('auth_profile')
