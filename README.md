@@ -102,6 +102,16 @@ Azure Testing:
     2.  https://www.pluralsight.com/
     3.  https://www.linkedin.com/
 
+### GitHub Actions deployment to alexz1008-fahrs
+
+The `main_alexz1008-fahrs.yml` workflow uses Azure OIDC login. Configure these GitHub Actions repository secrets for the Azure identity and subscription that can deploy to this Function App:
+
+- `AZUREAPPSERVICE_CLIENTID_94BC2492542F4674A65A3F57BAE70BF8`: application (client) ID.
+- `AZUREAPPSERVICE_TENANTID_E1B6D4056A764BDC8A3927AC14C03E5A`: Microsoft Entra tenant ID.
+- `AZUREAPPSERVICE_SUBSCRIPTIONID_1EEDB19008524A5395C73E504B828470`: Azure subscription ID.
+
+Give the identity permission to deploy to `alexz1008-fahrs` and configure a federated credential with issuer `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and subject `repo:OWNER/REPOSITORY:ref:refs/heads/main` (replace `OWNER/REPOSITORY` with this repository's actual owner and name). The workflow customizes the repository-wide OIDC subject to include `repo` and `ref`; other workflows using OIDC must also have matching federated credentials. Manual runs from other refs require corresponding trusted subjects.
+
 ### Crawling an authenticated WordPress site
 
 Anonymous crawling remains the default. To crawl a protected WordPress site, configure these Function App settings:

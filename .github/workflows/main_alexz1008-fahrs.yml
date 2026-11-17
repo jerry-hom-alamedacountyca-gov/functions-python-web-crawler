@@ -59,6 +59,21 @@ jobs:
       actions: write #This is required for OIDC sub claim customization
 
     steps:
+      - name: Validate Azure login configuration
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZUREAPPSERVICE_CLIENTID_94BC2492542F4674A65A3F57BAE70BF8 }}
+          AZURE_TENANT_ID: ${{ secrets.AZUREAPPSERVICE_TENANTID_E1B6D4056A764BDC8A3927AC14C03E5A }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1EEDB19008524A5395C73E504B828470 }}
+        run: |
+          missing=0
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} is missing. Configure the Azure deployment secrets described in README.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
