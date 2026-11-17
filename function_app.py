@@ -764,3 +764,32 @@ def upload_to_blob_storage(url, documents):
         logging.error(f"Error uploading to blob storage: {error}")
         logging.error(traceback.format_exc())
 
+#kpotluri 11/17/2026 added to test the playwright in the function App
+@app.timer_trigger(
+    schedule="0 */30 * * * *",
+    arg_name="mytimer",
+    run_on_startup=True
+)
+def test_playwright(mytimer: func.TimerRequest):
+ 
+    logging.info("Starting Playwright test")
+ 
+    try:
+        with sync_playwright() as p:
+ 
+            browser = p.chromium.launch(headless=True)
+ 
+            page = browser.new_page()
+ 
+            page.goto("https://gsa.alcoweb.org")
+ 
+            logging.info("Title: %s", page.title())
+            logging.info("URL: %s", page.url)
+ 
+            browser.close()
+ 
+    except Exception as ex:
+        logging.exception(
+            "Playwright failed: %s",
+            str(ex)
+        )
