@@ -10,3 +10,5 @@ beautifulsoup4
 requests
 validators
 lxml
+playwright
+ 
