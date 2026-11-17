@@ -772,24 +772,26 @@ def upload_to_blob_storage(url, documents):
 )
 def test_playwright(mytimer: func.TimerRequest):
  
-    logging.info("Starting Playwright test")
+    logging.warning("PLAYWRIGHT TEST STARTED")
  
     try:
         with sync_playwright() as p:
  
+            logging.warning("PLAYWRIGHT LOADED")
+ 
             browser = p.chromium.launch(headless=True)
+ 
+            logging.warning("BROWSER LAUNCHED")
  
             page = browser.new_page()
  
             page.goto("https://gsa.alcoweb.org")
  
-            logging.info("Title: %s", page.title())
-            logging.info("URL: %s", page.url)
+            logging.warning("TITLE=%s", page.title())
  
             browser.close()
  
+            logging.warning("PLAYWRIGHT TEST COMPLETED")
+ 
     except Exception as ex:
-        logging.exception(
-            "Playwright failed: %s",
-            str(ex)
-        )
+        logging.exception("PLAYWRIGHT TEST FAILED")
