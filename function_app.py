@@ -769,25 +769,15 @@ def upload_to_blob_storage(url, documents):
 def playwright_test(req: func.HttpRequest):
  
     try:
-        with sync_playwright() as p:
+        from playwright.sync_api import sync_playwright
  
-            browser = p.chromium.launch(headless=True)
- 
-            page = browser.new_page()
- 
-            page.goto("https://gsa.alcoweb.org")
- 
-            title = page.title()
- 
-            browser.close()
- 
-            return func.HttpResponse(
-                f"SUCCESS: {title}",
-                status_code=200
-            )
+        return func.HttpResponse(
+            "Playwright import successful",
+            status_code=200
+        )
  
     except Exception as ex:
         return func.HttpResponse(
-            str(ex),
+            f"Import failed: {str(ex)}",
             status_code=500
         )
