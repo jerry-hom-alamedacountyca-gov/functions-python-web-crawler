@@ -771,13 +771,16 @@ def playwright_test(req: func.HttpRequest):
     try:
         from playwright.sync_api import sync_playwright
  
+        with sync_playwright() as p:
+            pass
+ 
         return func.HttpResponse(
-            "Playwright import successful",
+            "Playwright engine started",
             status_code=200
         )
  
     except Exception as ex:
         return func.HttpResponse(
-            f"Import failed: {str(ex)}",
+            f"Failed: {str(ex)}",
             status_code=500
         )
