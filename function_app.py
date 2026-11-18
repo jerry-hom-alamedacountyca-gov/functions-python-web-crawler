@@ -765,33 +765,29 @@ def upload_to_blob_storage(url, documents):
         logging.error(traceback.format_exc())
 
 #kpotluri 11/17/2026 added to test the playwright in the function App
-@app.timer_trigger(
-    schedule="0 */30 * * * *",
-    arg_name="mytimer",
-    run_on_startup=True
-)
-def test_playwright(mytimer: func.TimerRequest):
- 
-    logging.warning("PLAYWRIGHT TEST STARTED")
+@app.route(route="playwright_test")
+def playwright_test(req: func.HttpRequest):
  
     try:
         with sync_playwright() as p:
  
-            logging.warning("PLAYWRIGHT LOADED")
- 
             browser = p.chromium.launch(headless=True)
- 
-            logging.warning("BROWSER LAUNCHED")
  
             page = browser.new_page()
  
             page.goto("https://gsa.alcoweb.org")
  
-            logging.warning("TITLE=%s", page.title())
+            title = page.title()
  
             browser.close()
  
-            logging.warning("PLAYWRIGHT TEST COMPLETED")
+            return func.HttpResponse(
+                f"SUCCESS: {title}",
+                status_code=200
+            )
  
     except Exception as ex:
-        logging.exception("PLAYWRIGHT TEST FAILED")
+        return func.HttpResponse(
+            str(ex),
+            status_code=500
+        )
